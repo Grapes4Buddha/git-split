@@ -1,0 +1,262 @@
+#!/usr/bin/perl
+use strict;
+use Getopt::Long;
+use Pod::Usage;
+use File::Temp qw(tempfile);
+
+=pod
+
+=head1 NAME
+
+B<git-split> - create a new commit history specific to a given subdirectory
+
+=head1 SYNOPSIS
+
+B<git-split> B<--directory>=I<subdir> [ B<--reference>=I<committish> ] I<source-commit>
+
+=head1 DESCRIPTION
+
+Occasionally it is useful to migrate a subdirectory out of a large repo into a
+new repo that contains only the contents of that subdirectory.  B<git-split>
+reconstructs the history of a subdirectory as a new set of commits that only
+contain the trees for that subdirectory.
+
+The split operation happens entirely within the original repo, resulting in a
+separate, disjoint history for the split-out directory.  This can then be
+pushed or pulled into the desired destination repo to complete the operation.
+
+If the split history is already available in the original repository, the
+B<--reference> option can be used to cause B<git-split> to determine the
+mapping of original commits to split-off commits and avoid re-exporting the
+commits that had been previously processed. 
+
+=head1 OPTIONS
+
+=over 4
+
+=item B<--directory>=I<subdir>
+
+I<subdir> is the top-level subdirectory that will be split off into its own
+history.  This is a required parameter.
+
+=item B<--reference>=I<committish>
+
+I<committish> points to the most recent known commit in the existing split-off
+history.  This is used to generate the mapping of original commits to existing
+split-off commits.  The mapping allows B<git-split> to save time by not having
+to re-export commits that have already been processed by previous runs.
+However, the process is entirely deterministic, so the generated commit ids
+will be identical whether or not this option is used.
+
+=item I<source-commit>
+
+The head commit to export from the original commit history.  This does not have
+to be the commit that the repo is currently pointing to.
+
+=back
+
+=head1 AUTHOR
+
+David Merrill <vobadm@gmail.com>
+
+=cut
+
+my %opt;
+GetOptions(\%opt,
+	"help",
+	"man",
+	"directory|d=s",
+	"reference=s",
+	"debug",
+) or pod2usage();
+pod2usage(-verbose=>1) if $opt{help};
+pod2usage(-verbose=>2) if $opt{man};
+
+die "Error: --directory is required!\n" unless $opt{directory};
+
+my $commit = shift @ARGV || "HEAD";
+
+# cached mapping of original commits to split commits.  Needed for translating
+# parent commits.
+my %subtree_map;
+if ($opt{reference}) {
+	# scan the reference history and populate the subtree map cache
+	my $log = `git log -z --pretty='format:%H%n%B' $opt{reference}`;
+	foreach my $entry (split(/\0/,$log)) {
+		my ($h,$b) = split(/\n/,$entry,2);
+		next unless $b =~ /^original-commit: (\S+)/m;
+		$subtree_map{$1} = $h;
+	}
+}
+
+my $last_new_commit;
+
+#
+# --parents enables parent rewriting when looking at the history of a subdirectory.
+# This gives us a nice 1:1 correlation between the original history and the split history.
+#
+# --reverse gives us the list of commits in the correct order for processing, so we can
+# be sure that the parent commits exist when we try to create them.
+#
+
+my @revlist = `git rev-list --topo-order --reverse --parents $commit -- $opt{directory}`;
+die "Error: could not run git rev-list: $!\n" if $?;
+chomp @revlist;
+my $start_time = time;
+my $total = scalar(@revlist);
+my $count = 0;
+my $max_status_length = 0;
+
+while ($_ = shift @revlist) {
+	my ($source_commit,@parents) = split(/ /,$_);
+
+	# skip anything we already have
+	next if defined $subtree_map{$source_commit};
+
+	my @newparents;
+	foreach my $p (@parents) {
+		die "Error: could not map parent commit $p!\n" unless defined $subtree_map{$p};
+		push @newparents,$subtree_map{$p};
+	}
+
+	print STDERR "$source_commit\n" if $opt{debug};
+	$last_new_commit = create_commit($opt{directory},$source_commit,@newparents);
+	$count++;
+
+	$subtree_map{$source_commit} = $last_new_commit;
+
+	if (-t STDERR) {
+		# print STDERR "$source_commit -> $last_new_commit\n";
+		my $status = "\rCommit $count/$total";
+		$status .= " (" . int(100* $count/$total) . "%)";
+
+		my $t = time;
+		if ($t > $start_time) {
+			my $remaining_time = int(($total - $count) * ($t - $start_time) / $count);
+			$status .= " ETA " . hhmmss($remaining_time) . " ";
+		}
+		$max_status_length = length($status) if length($status) > $max_status_length;
+		print STDERR "$status";
+	}
+}
+
+print STDERR "\r", " "x$max_status_length,"\r";
+print STDERR "Processed $count commits in ", hhmmss(time - $start_time),".\n";
+
+# print this so that the user knows what was created.  We don't create any refs, so this is just dangling
+# in the repo until the user does something with it (or it gets garbage collected).
+print $last_new_commit,"\n";
+exit 0;
+
+sub hhmmss {
+	my $sec = shift;
+	my $hh = int($sec / 3600);
+	my $mm = int(($sec - ($hh*3600)) / 60);
+	my $ss = $sec % 60;
+	return sprintf "%d:%02d:%02d", $hh,$mm,$ss;
+}
+
+#
+# create_commit($directory,$source_commit,@parents)
+#
+# Creates a new commit for directory $directory corresponding to
+# $source_commit, with parents @parents.
+#
+# @parents refers to the new commits actual parents in the split-off history,
+# not the parents of the source commit.
+#
+# Returns the sha1 of the newly-created commit.
+# 
+sub create_commit {
+	my $directory = shift;
+	my $source_commit = shift;
+	my @parents = @_;
+
+	#
+	# Grab the required metadata for the commit.
+	#
+	# "git commit-tree" requires that some of this gets passed in through the env.  So set that here and be sure to
+	# clear the corresponding env vars when done.
+	#
+	my $commit_info = `git log -1 --parents  --pretty=format:'%H%n%P%n%an%n%ae%n%aD%n%cn%n%ce%n%cD%n%B' $source_commit -- $directory`;
+	my $sha1;
+	my $orig_parents;
+	my $message;
+	(
+		$sha1,
+		$orig_parents,
+		$ENV{GIT_AUTHOR_NAME},
+		$ENV{GIT_AUTHOR_EMAIL},
+		$ENV{GIT_AUTHOR_DATE},
+		$ENV{GIT_COMMITTER_NAME},
+		$ENV{GIT_COMMITTER_EMAIL},
+		$ENV{GIT_COMMITTER_DATE},
+		$message
+	) = split(/\n/,$commit_info,9);
+
+	#
+	# Some (apparently very old) git commits may not have all of their
+	# fields filled out, which causes 'git commit-tree' to barf.  Sadly, we
+	# must fudge the data here, which means that tools similar to us might
+	# generate different commit ids than we would.
+	#
+	if (($ENV{GIT_AUTHOR_NAME} eq "") && ($ENV{GIT_COMMITTER_NAME} eq "")) {
+		$ENV{GIT_AUTHOR_NAME} = $ENV{GIT_COMMITTER_NAME} = "unknown";
+		print STDERR "Warning: Author and Committer names for $source_commit not set.  Defaulting to 'unknown'.\n";
+	}
+
+	if ($ENV{GIT_AUTHOR_NAME} eq "") {
+		print STDERR "Warning: Author name for $source_commit not set.  Defaulting to GIT_COMMITTER_NAME ($ENV{GIT_COMMITTER_NAME}).\n";
+		$ENV{GIT_AUTHOR_NAME} = $ENV{GIT_COMMITTER_NAME};
+	} 
+
+	if ($ENV{GIT_COMMITTER_NAME} eq "") {
+		print STDERR "Warning: Committer name for $source_commit not set.  Defaulting to GIT_AUTHOR_NAME ($ENV{GIT_AUTHOR_NAME}).\n";
+		$ENV{GIT_COMMITTER_NAME} = $ENV{GIT_AUTHOR_NAME};
+	}
+
+	#
+	# Find the tree object to use for the commit.
+	#
+	# This is what "git ls-tree" reports for the desired directory.
+	#
+	my $lstree = `git ls-tree -d $sha1 -- $directory`;
+	chomp $lstree;
+	my ($tree) = $lstree =~ /^\S+ tree (\S+)\t\S+$/;   # format specified in git ls-tree(1)
+	die "Error: Could not get tree for $sha1 in $directory!\n" unless $tree;
+
+	# append an "original-commit:" line at the end of the commit message.
+	# This is what subsequent invocations of this script will use to
+	# pre-populate the mappings of source commits to split-off commits.
+	$message .= "\noriginal-commit: $sha1\n";
+
+	#
+	# Create the new commit.
+	#
+	my $cmd = "git commit-tree";
+	foreach my $p (@parents) {
+		$cmd .= " -p $p";
+	}
+	$cmd .= " $tree";
+
+	my ($tmpfh,$tmpfname) = tempfile()
+		or die "Error: Could not create temp file!\n";
+	print $tmpfh $message;
+	close $tmpfh;
+
+	my $newcommit = `$cmd < $tmpfname`;
+	die "Error: commit-tree failed!\n" if $?;
+
+	delete $ENV{GIT_AUTHOR_NAME};
+	delete $ENV{GIT_AUTHOR_EMAIL};
+	delete $ENV{GIT_AUTHOR_DATE};
+	delete $ENV{GIT_COMMITTER_NAME};
+	delete $ENV{GIT_COMMITTER_EMAIL};
+	delete $ENV{GIT_COMMITTER_DATE};
+
+	# print "New commit is $newcommit\n";
+	chomp $newcommit;
+	return $newcommit;
+}
+
+exit 0;
